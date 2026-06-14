@@ -323,7 +323,7 @@ float galDust(vec2 p, float along, float bd, float gcen, float seed){
 }
 
 vec3 fieldStars(vec2 c, float seed, vec2 rdir, float el, float zk, float warp,
-                mat2 invSR, float crossAmt){
+                mat2 invSR, float crossAmt, float dustRest){
     // galactic plane: a band across the sky (orientation/offset per location)
     // along which stars are markedly denser -- the Milky-Way disk edge-on.
     float ga   = hash11(seed * 0.531 + 4.0) * 3.14159;
@@ -364,7 +364,11 @@ vec3 fieldStars(vec2 c, float seed, vec2 rdir, float el, float zk, float warp,
     // local dark gas clouds sit IN FRONT of the dense carpet (hiding it) but
     // BEHIND the resolved field stars above (which already accumulated in col).
     // So the bright point stars punch through the clouds; the carpet is occluded.
-    float dark = galDust(c, dot(c, gD), bd, gcen, seed) * galOn;
+    // cruise (warp == 0, so zk == 1 and c == the rest position): reuse the
+    // galDust already evaluated in mainImage instead of recomputing the same
+    // 6-fbm field here -- the two were bit-identical. During warp c is streaked,
+    // so the dust must still be sampled per streak position.
+    float dark = (warp > 0.0 ? galDust(c, dot(c, gD), bd, gcen, seed) : dustRest) * galOn;
     col += carpet * (1.0 - dark);
     // LATE WARP: a perspective (1/r^2) field packs dense stars + tails into
     // the centre. Absent in cruise (no centre haze); ramps in for the finale.
@@ -609,11 +613,36 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord){
     }
     float crossAmt = still * spikeGrow;            // = 1 (fully shown) when warp off
 
+    // galactic-plane parameters (seed-only) + the dark dust field at the REST
+    // position, computed ONCE here: fieldStars reuses this dust value in cruise
+    // instead of recomputing the same 6-fbm field, and the band-glow assembly
+    // below reuses these same parameters too (they were duplicated).
+    float gga  = hash11(seed * 0.531 + 4.0) * 3.14159;
+    vec2  ggN  = vec2(-sin(gga), cos(gga));               // across the band
+    vec2  ggD  = vec2( cos(gga), sin(gga));               // along the band
+    float ggO  = (hash11(seed * 0.917 + 8.0) - 0.5) * 0.7;
+    float gbd  = dot(pr, ggN) - ggO;
+    float gcen2= (hash11(seed * 0.71 + 5.0) - 0.5) * 0.8; // bulge location (matches stars)
+    float galOn= step(0.5, hash11(seed * 0.331 + 2.0));   // ~50%: this region has a disk
+    galOn *= (1.0 - isNeb);                               // a nebula owns the sky instead
+    float gdark= galDust(pr, dot(pr, ggD), gbd, gcen2, seed);
+
     bool  warping = (zHi - zLo) > 0.001;
-    int   K = warping ? KMAX : 1;
+    // adaptive motion-blur sample count, driven by the streak LENGTH in time
+    // (zHi - zLo), NOT by screen radius: at the climax the radial speed-lines
+    // emanate from the centre, so centre pixels need the FULL sample count too.
+    // The saving comes from the entry/exit ramps, where the streaks are short
+    // everywhere at once. (1.1 == the max span: entry climax zHi-zLo = EMAX.)
+    int   K = warping ? int(clamp(ceil((zHi - zLo) * (float(KMAX) / 1.1)),
+                                  8.0, float(KMAX))) : 1;
     vec2  rdir = normalize(pr + vec2(1e-5));         // radial direction from centre
     float el   = 1.0 + warp * EL;                    // dash stretch during warp
-    float jit  = hash11(dot(fragCoord, vec2(0.0073, 0.0131)));
+    // per-pixel dither for the blur phase. MUST be a decorrelated 2D hash: a
+    // linear hash like hash11(dot(fragCoord, k)) has DIAGONAL iso-lines, and once
+    // K drops below ~20 the residual sampling-phase error follows those lines and
+    // shows up as diagonal "scratches" across the warp. hash22 has no such bias,
+    // so any residual reads as fine grain instead.
+    float jit  = hash22(fragCoord).x;
     vec3  stars = vec3(0.0);
     for (int k = 0; k < KMAX; k++){
         if (k >= K) break;
@@ -622,7 +651,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord){
         vec2  q  = pr / zk;
         // MAX (not sum/K): every point on the streak keeps the star's FULL
         // brightness -- so even the short early streaks read brightly.
-        stars = max(stars, fieldStars(q, seed, rdir, el, zk, warp, invSR, crossAmt));
+        stars = max(stars, fieldStars(q, seed, rdir, el, zk, warp, invSR, crossAmt, gdark));
     }
     stars *= STAR_GAIN;
 
@@ -636,25 +665,15 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord){
     vec3 space = vec3(0.004, 0.006, 0.012);
     space += stars;
 
-    // galactic band: faint diffuse glow of unresolved stars + dust lanes,
-    // along the same plane the field is densified on. A cruise feature
-    // (fades during the jump). Orientation per location (seed).
-    float gga  = hash11(seed * 0.531 + 4.0) * 3.14159;
-    vec2  ggN  = vec2(-sin(gga), cos(gga));               // across the band
-    vec2  ggD  = vec2( cos(gga), sin(gga));               // along the band
-    float ggO  = (hash11(seed * 0.917 + 8.0) - 0.5) * 0.7;
-    float gbd  = dot(pr, ggN) - ggO;
+    // galactic band glow: faint diffuse light of unresolved stars + dust lanes,
+    // along the same plane the field is densified on. A cruise feature (fades
+    // during the jump). Reuses the plane parameters and dust field (gdark)
+    // already computed before the sample loop above.
     float gband= exp(-gbd * gbd / sq(GAL_WIDTH * 1.6));   // soft glow along the whole band
-    float gcen2= (hash11(seed * 0.71 + 5.0) - 0.5) * 0.8; // bulge location (matches stars)
     float gbul = exp(-sq((dot(pr, ggD) - gcen2) / GAL_BULGE));
     float dust = fbm(pr * 3.0 + seed);
     float lane = smoothstep(0.35, 0.70, fbm(pr * 7.0 + seed + 11.0));
     vec3  gcol = mix(vec3(0.05, 0.05, 0.07), vec3(0.11, 0.10, 0.10), dust);
-    float galOn = step(0.5, hash11(seed * 0.331 + 2.0)); // same flag as fieldStars
-    galOn *= (1.0 - isNeb);                               // a nebula owns the sky instead
-    // local dark clouds also block the fog glow behind them (same field as the
-    // carpet occlusion in fieldStars), so the dark patches read as silhouettes.
-    float gdark = galDust(pr, dot(pr, ggD), gbd, gcen2, seed);
     // a touch denser only where the stars crowd (the bulge) -- kept subtle
     space += gcol * gband * (1.0 + 0.5 * gbul) * GAL_GLOW
              * (1.0 - 0.6 * lane) * (1.0 - gdark)

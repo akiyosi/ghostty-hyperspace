@@ -72,7 +72,7 @@ Edit the constants at the top of `hyperspace.glsl`.
 | `SLOW_T` / `SLOW_FRAC` | `0.7` / `0.08` | The gentle slow start of the entry: tails creep to `SLOW_FRAC` of full length over `SLOW_T` seconds before extending the rest. |
 | `EMAX` | `1.1` | How far entry tails extend outward. |
 | `CONV` | `0.96` | How far the exit's inward tails reach toward the centre (`<1`). |
-| `KMAX` / `EL` | `20` / `18` | Motion‑blur sample count and per‑sample radial stretch (keeps streaks continuous). |
+| `KMAX` / `EL` | `20` / `18` | Motion‑blur sample **cap** and per‑sample radial stretch (keeps streaks continuous). The actual sample count adapts to the streak length, so only the brief climax uses the full `KMAX` (see *Performance*). |
 
 ### Starfield
 
@@ -108,8 +108,11 @@ Edit the `hn < …` thresholds to change how often a bright sun appears.
 | Constant | Default | Meaning |
 |---|---|---|
 | `GAL_WIDTH` | `0.22` | Thickness of the galactic band. |
-| `GAL_DENS` | `3.5` | Extra star density along the disk plane. |
-| `GAL_GLOW` | `1.4` | Diffuse dust‑glow brightness. |
+| `GAL_DENS` | `4.0` | Extra star density along the disk plane (piles up at the bulge). |
+| `GAL_GLOW` | `0.55` | Diffuse, unresolved‑star glow brightness of the band. |
+| `GAL_BULGE` | `0.5` | Along‑band size of the bright galactic centre. |
+| `GAL_GRAIN` | `0.05` | Baseline brightness of the dim star "carpet" in the bulge. |
+| `GAL_DUST` | `0.92` | Darkness of the local dark gas clouds over the bulge (`0..1`). |
 
 A disk appears in ~50% of locations (see the `galOn = step(0.5, …)` in
 `fieldStars`/`mainImage`).
@@ -122,7 +125,7 @@ outcome).
 | Constant | Default | Meaning |
 |---|---|---|
 | `NEBULA_PROB` | `0.08` | Chance a destination is inside a nebula. |
-| `NEBULA_GAIN` | `0.70` | Nebula brightness (kept gentle so text stays legible). |
+| `NEBULA_GAIN` | `0.38` | Nebula brightness (kept gentle so text stays legible). |
 | `NEB_STAR_GAIN` | `1.3` | Brightness of the cluster stars embedded in the gas (white core). |
 | `NEB_STAR_RARE` | `0.84` | Sparseness of those stars (higher = fewer). |
 | `NEB_STAR_DENS` | `0.48` | Only place them where the gas density exceeds this. |
@@ -139,11 +142,30 @@ const float BG_LEVEL = 0.12;  // background brightness; raise to just above your
 const float BG_SOFT  = 0.10;  // glyph-edge softness of the key
 ```
 
+## Performance
+
+Cost is dominated by the number of noise/`fbm` evaluations per pixel, **not** by
+the star count (density is essentially free — the streaks are a radial zoom‑blur
+whose cost is the sample count, not the stars).
+
+- **Cruise is cheap.** The blur collapses to a single sample (`K = 1`), so idle
+  frames just draw the static field once.
+- **Adaptive blur sampling.** During a warp the sample count tracks the streak
+  *length in time* (`zHi − zLo`), capped at `KMAX`. The entry/exit ramps — where
+  the streaks are short everywhere — use far fewer samples; only the brief climax
+  spends the full `KMAX`. The dither is a decorrelated 2‑D hash, so a reduced
+  sample count reads as fine grain rather than diagonal banding.
+- **Shared dust field.** The galactic dark‑dust field (`galDust`, the heaviest
+  per‑pixel `fbm`) is evaluated once at the rest position and reused by both the
+  starfield and the band glow in cruise, instead of being computed twice.
+
+Knobs: lower `KMAX` if the climax frames still feel heavy; raise `DENS` for more
+stars (cheap). The nebula/`fbm`‑heavy octaves in `nebula`/`fbmHi` only run when
+you actually arrive inside a (rare) nebula region.
+
 ## Notes
 
 - The shader is deterministic in `iTime`; a per‑launch offset from `iDate`
   randomises the *first* sky between launches without affecting the per‑jump
   reseed. If your platform's `iDate` is unstable you can drop that offset (see
   the `launch` line in `mainImage`).
-- Performance scales with `KMAX` (warp only) and `DENS`. Lower `KMAX` if the
-  jump frames feel heavy; raise `DENS` for more stars (cheap).
