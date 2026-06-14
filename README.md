@@ -165,7 +165,9 @@ you actually arrive inside a (rare) nebula region.
 
 ## Notes
 
-- The shader is deterministic in `iTime`; a per‑launch offset from `iDate`
-  randomises the *first* sky between launches without affecting the per‑jump
-  reseed. If your platform's `iDate` is unstable you can drop that offset (see
-  the `launch` line in `mainImage`).
+- The shader is deterministic in `iTime`. An optional per‑launch offset
+  (`#define LAUNCH_RANDOM 1`) randomises the *first* sky between launches, but it
+  needs a smooth, sub‑second `iDate.w`. **Ghostty quantises `iDate.w` to whole
+  seconds**, which makes that offset reseed the sky every second, so
+  `LAUNCH_RANDOM` defaults to `0` (a rock‑steady field; the sky still changes on
+  every jump). Enable it only on platforms with a stable sub‑second `iDate.w`.

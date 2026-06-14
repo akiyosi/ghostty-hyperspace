@@ -80,6 +80,15 @@ const float NEB_STAR_RARE = 0.84; // sparseness of those stars (higher = fewer, 
 const float NEB_STAR_DENS = 0.48; // only host stars where the gas density exceeds this
 const float NEB_STAR_TINT = 0.7;  // how much the halo takes the gas colour (core stays white)
 
+// ---- seeding ------------------------------------------------
+// Randomise the FIRST sky per launch by deriving a session constant from
+// (iDate.w - iTime). This needs iDate.w to advance smoothly in lockstep with
+// iTime. Some platforms (notably Ghostty) quantise iDate.w to WHOLE SECONDS, so
+// the difference is a sawtooth and the sky reseeds every second. Leave this 0
+// there (rock-steady field); set 1 only if your platform has a sub-second,
+// stable iDate.w and you want the starting sky randomised between launches.
+#define LAUNCH_RANDOM 0
+
 // ---- compositing (opaque-safe: Ghostty AND Zonvie) ----------
 #define BLEND_ALPHA 0           // 1: alpha blend (transparent Ghostty only)
 const float BG_LEVEL = 0.12;    // theme background brightness (raise if needed)
@@ -569,13 +578,16 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord){
     vec2  ps = p + shake;
     float r  = length(ps);
 
-    // new region after each jump (seed advances at the peak flash/swap, so
-    // the destination field is what decelerates into place). A per-LAUNCH
-    // offset comes from the launch wall-time = floor(iDate.w - iTime): both
-    // advance together so their difference is the (constant) start second --
-    // FLOORED so sub-frame clock jitter can't change it (no flicker), yet it
-    // differs between launches so even the first sky is random.
+    // new region after each jump (seed advances at the peak flash/swap, so the
+    // destination field is what decelerates into place). The per-LAUNCH offset
+    // (gated by LAUNCH_RANDOM) recovers the constant launch wall-second from
+    // floor(iDate.w - iTime); when disabled the field is fully deterministic in
+    // iTime, which is what keeps it steady on platforms with a coarse iDate.w.
+#if LAUNCH_RANDOM
     float launch = hash11(floor(iDate.w - iTime) + 0.5) * 977.0;
+#else
+    float launch = 0.0;
+#endif
     float seed = (WARP_INTERVAL <= 0.0)
                ? launch                                   // never warp -> one fixed sky
                : mod(floor((iTime - PEAK_T) / CYCLE) * 131.7 + launch, 977.0);
