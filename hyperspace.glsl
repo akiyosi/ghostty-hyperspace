@@ -37,7 +37,8 @@ const float EXIT_T    = 17.0;   // arrival: dense centre lines converge (~4s)
 
 const float EMAX      = 1.1;    // entry stretch: how far each line extends outward
 const float CONV      = 0.96;   // exit stretch: inward tails reach near the centre (<1)
-const float ACCEL     = 1.7;    // >1 accelerates; the jump keeps streaming to the peak
+const float SLOW_T    = 0.7;    // seconds the tail spends slowly starting to extend
+const float SLOW_FRAC = 0.08;   // small length reached by the end of that slow onset
 const int   KMAX      = 20;     // motion-blur samples during warp
 const float EL        = 18.0;   // radial stretch of each sample (joins streaks)
 
@@ -290,10 +291,18 @@ void warpState(float t, out float zLo, out float zHi, out float warp,
     if (ph < JUMP_T || ph >= EXIT_T){
         zLo = 1.0; zHi = 1.0; warp = 0.0;                 // cruise: points at Q
     } else if (ph < PEAK_T){
-        float accel = (ph - JUMP_T) / (PEAK_T - JUMP_T);
+        // tails grow OUTWARD from the star: the first SLOW_T seconds it only
+        // creeps out slowly (the gentle "starting to extend"), then it grows
+        // the rest of the way to full length by the peak. Linear segments so
+        // the slow onset is steady (no extra slow patch afterwards).
+        float te    = ph - JUMP_T;                        // seconds into entry
+        float entry = PEAK_T - JUMP_T;
+        float g = (te < SLOW_T)
+                ? (te / SLOW_T) * SLOW_FRAC
+                : SLOW_FRAC + (1.0 - SLOW_FRAC) * ((te - SLOW_T) / (entry - SLOW_T));
         zLo = 1.0;
-        zHi = 1.0 + EMAX * pow(accel, ACCEL * 0.7);       // grow OUTWARD from star
-        warp = accel;
+        zHi = 1.0 + EMAX * g;
+        warp = g;
     } else {
         float d = smoothstep(0.0, 1.0, (ph - PEAK_T) / (EXIT_T - PEAK_T));
         zLo = 1.0 - CONV * (1.0 - d);                     // inward tail retracts...
