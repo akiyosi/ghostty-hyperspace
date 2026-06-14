@@ -66,12 +66,14 @@ const float CROSS_RATE= 0.9999; // step threshold -> ~0.01% of points carry a sm
 const float CROSS_AMP = 0.22;   // brightness of that cross
 const float CROSS_LEN = 0.025;  // its arm length (screen heights)
 const float GAL_WIDTH = 0.22;   // thickness of the galactic band (screen heights)
-const float GAL_DENS  = 3.5;    // extra star density along the galactic plane
-const float GAL_GLOW  = 1.4;    // brightness of the band's diffuse (unresolved) glow
+const float GAL_DENS  = 4.0;    // extra star density along the disk (piles up at the bulge)
+const float GAL_GLOW  = 0.55;   // brightness of the band's diffuse (unresolved) glow
+const float GAL_BULGE = 0.5;    // along-band size of the bright galactic centre (bulge)
+const float GAL_GRAIN = 0.05;   // baseline carpet-point brightness (just above the fog)
 
 // ---- rare destination regions (rolled per jump from the seed) ------
 const float NEBULA_PROB = 0.08; // chance a destination drops you inside a nebula (rare)
-const float NEBULA_GAIN = 0.70; // nebula brightness (keep gentle so text stays legible)
+const float NEBULA_GAIN = 0.38; // nebula brightness (keep gentle so text stays legible)
 const float NEB_STAR_GAIN = 1.3;  // brightness of the nebula's embedded stars (white core)
 const float NEB_STAR_RARE = 0.84; // sparseness of those stars (higher = fewer, "ポツポツ")
 const float NEB_STAR_DENS = 0.48; // only host stars where the gas density exceeds this
@@ -182,7 +184,9 @@ vec3 cellLayer(vec2 c, float scale, float seed, float pw, float gain,
     // correlates the tiers); this keeps brightness/colour/type uncorrelated
     // and the placement looking random, not patterned.
     float br = pow(hash22(id + vec2(seed +  0.5, seed * 1.3 + 2.1)).x, pw);
-    br *= galDen;                                     // denser along the galaxy
+    // galaxy density REVEALS faint stars but leaves bright ones alone, so a
+    // crowded disk shows MORE stars without blooming the bright ones into blobs.
+    br *= mix(galDen, 1.0, br);
     // special stars (near-glow / cross) ONLY on coarse octaves, whose cells are
     // big enough to hold their wide effect; otherwise the halo/cross would be
     // clipped at the cell edge (only this cell is sampled).
@@ -276,17 +280,53 @@ vec3 nebStarLayer(vec2 c, float scale, float so, vec3 tint,
     return (vec3(core) + haloCol * halo) * br * NEB_STAR_GAIN;
 }
 
+// dim, numerous star "carpet" for the dense galactic disk: a fine field of
+// faint points whose PRESENCE (not brightness) is gated by `amt` (0..1, the
+// local disk density), so the bulge fills with countless dim stars while the
+// rest of the sky stays clear. Streaks with the field via rdir/el/zk.
+vec3 galGrainStars(vec2 c, float scale, float so, vec2 rdir, float el, float zk, float amt){
+    if (amt < 0.004) return vec3(0.0);
+    vec2  g  = c * scale;
+    vec2  id = floor(g);
+    vec2  f  = fract(g) - 0.5;
+    float present = step(1.0 - amt, hash22(id + vec2(so + 1.0, so * 1.3 + 2.0)).x);
+    if (present < 0.5) return vec3(0.0);
+    vec2  off = (hash22(id + vec2(so + 5.0, so * 0.7 + 9.0)) - 0.5) * 0.8;
+    vec2  rel = f - off;
+    float al  = dot(rel, rdir);
+    float pe  = dot(rel, vec2(-rdir.y, rdir.x));
+    float rad = STAR_PX * scale / zk * 0.9;            // small points
+    float d2  = sq(pe / max(rad, 1e-4)) + sq(al / max(rad * el, 1e-4));
+    float ch  = hash22(id + vec2(so + 23.0, so * 0.9 + 7.0)).x;
+    // the vast majority are faint points only a touch brighter than the fog
+    // (GAL_GRAIN baseline, small spread); a high pow() adds a RARE brighter one.
+    float h   = hash22(id + vec2(so + 3.0, so * 0.5 + 4.0)).y;
+    float br  = GAL_GRAIN * (0.85 + 0.5 * h) + GAL_GRAIN * 6.0 * pow(h, 18.0);
+    return starColor(ch) * br * exp(-d2);               // coloured points, no halo
+}
+
 vec3 fieldStars(vec2 c, float seed, vec2 rdir, float el, float zk, float warp,
                 mat2 invSR, float crossAmt){
     // galactic plane: a band across the sky (orientation/offset per location)
     // along which stars are markedly denser -- the Milky-Way disk edge-on.
     float ga   = hash11(seed * 0.531 + 4.0) * 3.14159;
-    vec2  gN   = vec2(-sin(ga), cos(ga));            // band normal
+    vec2  gN   = vec2(-sin(ga), cos(ga));            // across the band
+    vec2  gD   = vec2( cos(ga), sin(ga));            // along the band
     float gOff = (hash11(seed * 0.917 + 8.0) - 0.5) * 0.7;
-    float bd   = dot(c, gN) - gOff;                   // distance from band centre
-    float band = exp(-bd * bd / (GAL_WIDTH * GAL_WIDTH));
+    float bd   = dot(c, gN) - gOff;                   // distance across the band
+    float gcen = (hash11(seed * 0.71 + 5.0) - 0.5) * 0.8; // galactic centre along band
     float galOn = step(0.5, hash11(seed * 0.331 + 2.0)); // ~50%: this region has a disk
-    float galDen = 1.0 + GAL_DENS * band * galOn;     // density bias toward the disk
+    galOn *= 1.0 - step(1.0 - NEBULA_PROB, hash11(seed * 0.741 + 17.0)); // never with a nebula
+    // star concentration: a COMPACT core at the galactic centre, deliberately
+    // SMALLER than the fog halo (which is GAL_WIDTH*1.6 across + the whole band),
+    // so the dense stars are ALWAYS ringed by the white fog -- a tight pile sat
+    // inside a larger soft glow, never filling the same area.
+    float conc  = exp(-(sq(bd / (GAL_WIDTH * 0.5))
+                      + sq((dot(c, gD) - gcen) / (GAL_BULGE * 0.55))));
+    float clump = smoothstep(0.32, 0.80, fbm(c * 5.0 + seed * 2.3));
+    // crowding is carried by the dim carpet (count); galDen just reveals faint
+    // stars in that compact core. Both share `conc`, so they stay in the core.
+    float galDen = 1.0 + GAL_DENS * pow(conc, 2.0) * (0.3 + 0.7 * clump) * galOn;
 
     // distant suns -- FIXED positions. During warp they stretch in place
     // (the radial sampling does it); they never fly past or vanish.
@@ -298,6 +338,13 @@ vec3 fieldStars(vec2 c, float seed, vec2 rdir, float el, float zk, float warp,
     col += ( cellLayer(c, 55.0, seed + 11.0, 3.0, 0.50, rdir, el, zk, galDen, invSR, crossAmt)
            + cellLayer(c,105.0, seed + 12.0, 3.6, 0.40, rdir, el, zk, galDen, invSR, crossAmt)
            + cellLayer(c,200.0, seed + 13.0, 4.0, 0.32, rdir, el, zk, galDen, invSR, crossAmt) ) * rev;
+    // dim star carpet: packed in the compact core, fading out well inside the
+    // fog halo. The clump field carves knots/voids; a high cap packs it tight.
+    float gdAmt = clamp(pow(conc, 2.0) * (0.12 + 0.88 * clump), 0.0, 0.95) * galOn;
+    // doubled again: each grid is sqrt(2) finer, so it holds 2x the cells (the
+    // points stay the same screen size -- only the count grows).
+    col += galGrainStars(c, 318.0 * DENS, seed + 71.0, rdir, el, zk, gdAmt)
+         + galGrainStars(c, 588.0 * DENS, seed + 72.0, rdir, el, zk, gdAmt);
     // LATE WARP: a perspective (1/r^2) field packs dense stars + tails into
     // the centre. Absent in cruise (no centre haze); ramps in for the finale.
     float late = smoothstep(0.25, 0.75, warp);
@@ -572,16 +619,21 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord){
     // along the same plane the field is densified on. A cruise feature
     // (fades during the jump). Orientation per location (seed).
     float gga  = hash11(seed * 0.531 + 4.0) * 3.14159;
-    vec2  ggN  = vec2(-sin(gga), cos(gga));
+    vec2  ggN  = vec2(-sin(gga), cos(gga));               // across the band
+    vec2  ggD  = vec2( cos(gga), sin(gga));               // along the band
     float ggO  = (hash11(seed * 0.917 + 8.0) - 0.5) * 0.7;
     float gbd  = dot(pr, ggN) - ggO;
-    float gband= exp(-gbd * gbd / sq(GAL_WIDTH * 1.6));
+    float gband= exp(-gbd * gbd / sq(GAL_WIDTH * 1.6));   // soft glow along the whole band
+    float gcen2= (hash11(seed * 0.71 + 5.0) - 0.5) * 0.8; // bulge location (matches stars)
+    float gbul = exp(-sq((dot(pr, ggD) - gcen2) / GAL_BULGE));
     float dust = fbm(pr * 3.0 + seed);
     float lane = smoothstep(0.35, 0.70, fbm(pr * 7.0 + seed + 11.0));
     vec3  gcol = mix(vec3(0.05, 0.05, 0.07), vec3(0.11, 0.10, 0.10), dust);
     float galOn = step(0.5, hash11(seed * 0.331 + 2.0)); // same flag as fieldStars
     galOn *= (1.0 - isNeb);                               // a nebula owns the sky instead
-    space += gcol * gband * GAL_GLOW * (1.0 - 0.6 * lane) * (1.0 - 0.85 * warp) * galOn;
+    // a touch denser only where the stars crowd (the bulge) -- kept subtle
+    space += gcol * gband * (1.0 + 0.5 * gbul) * GAL_GLOW
+             * (1.0 - 0.6 * lane) * (1.0 - 0.85 * warp) * galOn;
 
     // rare nebula GAS -- vanishes quickly once the jump begins (gone by warp
     // ~0.22) and settles back in only on arrival. Its dust lanes (ext) dim the
