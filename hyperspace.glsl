@@ -30,10 +30,14 @@
 // =============================================================
 
 // ---------------- tunables -----------------------------------
-const float CYCLE     = 24.0;   // seconds between jumps
-const float JUMP_T    = 9.0;    // warp begins (tails grow outward)
-const float PEAK_T    = 13.0;   // field swap flash (~4s entry, snappier)
-const float EXIT_T    = 17.0;   // arrival: dense centre lines converge (~4s)
+const float WARP_INTERVAL = 16.0; // cruise seconds between warps (0 = never warp)
+const float ENTRY_DUR     = 4.0;  // warp entry length (tails grow outward)
+const float EXIT_DUR      = 4.0;  // warp exit length (lines converge)
+// derived timeline (do not edit)
+const float CYCLE  = WARP_INTERVAL + ENTRY_DUR + EXIT_DUR;
+const float JUMP_T = WARP_INTERVAL;                 // warp begins
+const float PEAK_T = WARP_INTERVAL + ENTRY_DUR;     // field swap flash
+const float EXIT_T = CYCLE;                         // arrival (cycle end)
 
 const float EMAX      = 1.1;    // entry stretch: how far each line extends outward
 const float CONV      = 0.96;   // exit stretch: inward tails reach near the centre (<1)
@@ -59,11 +63,11 @@ const float NEAR_GLOW = 0.12;   // soft halo of those rare stars (NO spikes -- t
                                 // stays exclusive to the hero "dazzling" suns)
 const float CROSS_RATE= 0.9999; // step threshold -> ~0.01% of points carry a small
                                 // diffraction cross (very rare special star)
-const float CROSS_AMP = 0.42;   // brightness of that cross
-const float CROSS_LEN = 0.035;  // its arm length (screen heights)
+const float CROSS_AMP = 0.22;   // brightness of that cross
+const float CROSS_LEN = 0.025;  // its arm length (screen heights)
 const float GAL_WIDTH = 0.22;   // thickness of the galactic band (screen heights)
-const float GAL_DENS  = 2.5;    // extra star density along the galactic plane
-const float GAL_GLOW  = 0.5;    // brightness of the band's diffuse (unresolved) glow
+const float GAL_DENS  = 3.5;    // extra star density along the galactic plane
+const float GAL_GLOW  = 1.4;    // brightness of the band's diffuse (unresolved) glow
 
 // ---- compositing (opaque-safe: Ghostty AND Zonvie) ----------
 #define BLEND_ALPHA 0           // 1: alpha blend (transparent Ghostty only)
@@ -139,12 +143,25 @@ vec3 cellLayer(vec2 c, float scale, float seed, float pw, float gain,
     vec2 g  = c * scale;
     vec2 id = floor(g);
     vec2 f  = fract(g) - 0.5;
-    float br = pow(hash11(dot(id, vec2(127.1, 311.7)) + seed), pw);
+    // per-cell attributes from a good 2D hash with INDEPENDENT offsets --
+    // never hash11(dot(id,k)) (its linear argument makes diagonal banding and
+    // correlates the tiers); this keeps brightness/colour/type uncorrelated
+    // and the placement looking random, not patterned.
+    float br = pow(hash22(id + vec2(seed +  0.5, seed * 1.3 + 2.1)).x, pw);
     br *= galDen;                                     // denser along the galaxy
-    vec2  off = (hash22(id + seed) - 0.5) * 0.7;
-    // rare "nearby" star: only slightly larger, modestly brighter, plus a
-    // SOFT halo (no diffraction cross -- that is the hero suns' alone)
-    float near = smoothstep(NEAR_RARE, 1.0, hash11(dot(id, vec2(91.7, 17.3)) + seed));
+    // special stars (near-glow / cross) ONLY on coarse octaves, whose cells are
+    // big enough to hold their wide effect; otherwise the halo/cross would be
+    // clipped at the cell edge (only this cell is sampled).
+    float coarse = step(scale, 45.0);
+    float near   = coarse * smoothstep(NEAR_RARE, 1.0,
+                           hash22(id + vec2(seed + 11.0, seed * 1.1 + 4.7)).x);
+    float crossH = coarse * step(CROSS_RATE,
+                           hash22(id + vec2(seed + 41.0, seed * 1.7 + 3.3)).y);
+    float special = max(near, crossH);
+    // pull SPECIAL stars toward the cell centre so their wide halo/cross stays
+    // inside the cell (no cut-off edges); ordinary points keep full jitter.
+    vec2  off = (hash22(id + vec2(seed + 5.0, seed * 0.7 + 9.3)) - 0.5)
+                * 0.9 * (1.0 - special * 0.85);
     float size = 1.0 + near * 0.45;
     br *= 1.0 + near * 1.3;
     vec2  rel = f - off;
@@ -155,20 +172,17 @@ vec3 cellLayer(vec2 c, float scale, float seed, float pw, float gain,
     float core = exp(-d2);
     float hd2  = sq(pe / max(rad * 6.0, 1e-4)) + sq(al / max(rad * 6.0 * el, 1e-4));
     float halo = near * NEAR_GLOW * exp(-hd2);         // gentle glow for near stars
-    float ch  = hash11(dot(id, vec2(57.0, 113.0)) + seed);
+    float ch  = hash22(id + vec2(seed + 23.0, seed * 0.9 + 7.1)).x;
     vec3  col = starColor(ch) * br * (core + halo) * gain;
 
-    // ~30% of points carry a small diffraction cross, screen-axis aligned
+    // the very rare cross star (flag computed above): screen-axis aligned
     // (undo the field rotation) and only at rest (crossAmt 0 during warp).
-    if (crossAmt > 0.001){
-        float cz = step(CROSS_RATE, hash11(dot(id, vec2(53.1, 7.7)) + seed));
-        if (cz > 0.0){
-            vec2  so  = invSR * (rel / scale);         // star->pixel, screen axes
-            float len = CROSS_LEN * crossAmt;
-            float sx  = exp(-sq(so.y) / sq(0.0014)) * exp(-abs(so.x) / max(len, 1e-4));
-            float sy  = exp(-sq(so.x) / sq(0.0014)) * exp(-abs(so.y) / max(len, 1e-4));
-            col += starColor(ch) * br * (sx + sy) * CROSS_AMP * crossAmt * gain;
-        }
+    if (crossAmt > 0.001 && crossH > 0.0){
+        vec2  so  = invSR * (rel / scale);             // star->pixel, screen axes
+        float len = CROSS_LEN * crossAmt;
+        float sx  = exp(-sq(so.y) / sq(0.0014)) * exp(-abs(so.x) / max(len, 1e-4));
+        float sy  = exp(-sq(so.x) / sq(0.0014)) * exp(-abs(so.y) / max(len, 1e-4));
+        col += starColor(ch) * br * (sx + sy) * CROSS_AMP * crossAmt * gain;
     }
     return col;
 }
@@ -184,10 +198,10 @@ vec3 polarLayer(vec2 q, float angN, float radS, float seed, float pw, float gain
     vec2 id = floor(lp);
     float aw = mod(id.x, angN);                       // seamless angular wrap
     vec2 hid = vec2(aw, id.y);
-    vec2 jj = (hash22(hid + seed) - 0.5) * 0.7;
+    vec2 jj = (hash22(hid + vec2(seed + 5.0, seed * 0.7 + 9.3)) - 0.5) * 0.7;
     vec2 f  = (fract(lp) - 0.5) - jj;
-    float br = pow(hash11(dot(hid, vec2(41.3, 289.1)) + seed), pw);
-    float ch = hash11(dot(hid, vec2(73.0, 29.0)) + seed);
+    float br = pow(hash22(hid + vec2(seed + 0.5, seed * 1.3 + 2.1)).x, pw);
+    float ch = hash22(hid + vec2(seed + 23.0, seed * 0.9 + 7.1)).x;
     return starColor(ch) * br * exp(-dot(f, f) / sq(0.34)) * gain;
 }
 
@@ -227,24 +241,27 @@ vec3 fieldStars(vec2 c, float seed, vec2 rdir, float el, float zk, float warp,
 //  Cruise: hot white core + airy glow + 4-point diffraction spikes,
 //  tinted by colour. Warp: it streaks with the field (no spikes).
 vec3 heroStars(vec2 p, float zLo, float zHi, float warp, float seed,
-               mat2 invSR, float spikeGrow, float still, float aspect){
+               mat2 invSR, mat2 SR, float spikeGrow, float still, float aspect){
     vec3 col = vec3(0.0);
-    // count: ~50% of jumps arrive beside no bright sun; the rest have 1..HERO_MAX
+    // count: mostly none or a single bright sun; two is rare, three never
     float hn = hash11(seed * 1.93 + 7.7);
-    int n = (hn < 0.50) ? 0 : (1 + int(hash11(seed * 2.7 + 3.0) * float(HERO_MAX)));
+    int n = (hn < 0.62) ? 0
+          : (hn < 0.98) ? 1 : 2;
     for (int i = 0; i < HERO_MAX; i++){
         if (i >= n) break;
         float fi  = float(i) + 1.0;
-        // position strongly randomised by BOTH the per-sun index and the
-        // per-jump seed, so it lands somewhere genuinely different each time
-        vec2  P   = (hash22(vec2(fi * 37.1 + seed * 1.7,
-                                 seed * 0.97 + fi * 13.3)) - 0.5) * 1.85;
+        // pick an ON-SCREEN position (screen/ps coords), randomised per sun and
+        // per jump, then rotate into the field's (pr) space. Keeping it on
+        // screen is why a present sun is actually visible.
+        vec2  hpos = (hash22(vec2(fi * 37.1 + seed * 1.7,
+                                  seed * 0.97 + fi * 13.3)) - 0.5)
+                     * vec2(aspect, 1.0) * 0.92;
+        vec2  P   = SR * hpos;
         float mag = mix(0.6, 1.0, hash11(fi * 6.6 + seed * 2.1));
         vec3  c   = starColor(hash11(fi * 7.1 + seed));
 
-        // on-screen test (in screen/ps coords): if the sun is off-screen,
-        // don't draw its realistic core/glow/spikes (no stray cross arms).
-        vec2  hpos = invSR * P;
+        // gentle fade if right at the screen edge (so a cross arm never peeks
+        // in from just outside)
         float ax   = aspect * 0.5;
         float vis  = (1.0 - smoothstep(ax - 0.05, ax + 0.02, abs(hpos.x)))
                    * (1.0 - smoothstep(0.45,     0.52,      abs(hpos.y)));
@@ -286,6 +303,11 @@ vec3 heroStars(vec2 p, float zLo, float zHi, float warp, float seed,
 //             (no misalignment, no zoom reset).
 void warpState(float t, out float zLo, out float zHi, out float warp,
                out float flash, out float coreGlow, out vec2 shake){
+    // WARP_INTERVAL == 0 -> never warp: a permanently static starfield
+    if (WARP_INTERVAL <= 0.0){
+        zLo = 1.0; zHi = 1.0; warp = 0.0; flash = 0.0; coreGlow = 0.0;
+        shake = vec2(0.0); return;
+    }
     float ph = mod(t, CYCLE);
 
     if (ph < JUMP_T || ph >= EXIT_T){
@@ -329,8 +351,15 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord){
     float r  = length(ps);
 
     // new region after each jump (seed advances at the peak flash/swap, so
-    // the destination field is what decelerates into place)
-    float seed = mod(floor((iTime - PEAK_T) / CYCLE) * 131.7, 977.0);
+    // the destination field is what decelerates into place). A per-LAUNCH
+    // offset comes from the launch wall-time = floor(iDate.w - iTime): both
+    // advance together so their difference is the (constant) start second --
+    // FLOORED so sub-frame clock jitter can't change it (no flicker), yet it
+    // differs between launches so even the first sky is random.
+    float launch = hash11(floor(iDate.w - iTime) + 0.5) * 977.0;
+    float seed = (WARP_INTERVAL <= 0.0)
+               ? launch                                   // never warp -> one fixed sky
+               : mod(floor((iTime - PEAK_T) / CYCLE) * 131.7 + launch, 977.0);
 
     // ---- radial zoom-blur: cost is K, not the star count --------
     //  q = ps/zk samples the field at receding "previous" positions;
@@ -345,19 +374,20 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord){
     mat2  invSR = mat2(cos(sa), sin(sa), -sin(sa), cos(sa));  // undo rotation (screen axes)
     vec2  pr = SR * ps;
 
-    // spike timing: crosses (hero + the ~30% field stars) appear only at rest
+    // spike timing: crosses (hero + the ~0.01% field stars) appear only at rest
     // and EXTEND after arrival; crossAmt = still * spikeGrow (0 during warp).
-    float phc = mod(iTime, CYCLE);
-    float clock = (phc >= EXIT_T) ? (phc - EXIT_T)
-                : (phc < JUMP_T)  ? (phc + CYCLE - EXIT_T)
-                                  : 0.0;
-    float spikeGrow = smoothstep(0.0, SPIKE_TIME, clock);
-    float still = (phc < JUMP_T || phc >= EXIT_T) ? 1.0
-                : (phc < PEAK_T) ? 0.0
-                : smoothstep(EXIT_T - 0.6, EXIT_T, phc);
-    // cross-stars are a very rare special point (~0.01%, set by CROSS_RATE);
-    // crosses still only appear at rest and extend after arrival.
-    float crossAmt = still * spikeGrow;
+    float spikeGrow = 1.0, still = 1.0;
+    if (WARP_INTERVAL > 0.0){
+        float phc = mod(iTime, CYCLE);
+        float clock = (phc >= EXIT_T) ? (phc - EXIT_T)
+                    : (phc < JUMP_T)  ? (phc + CYCLE - EXIT_T)
+                                      : 0.0;
+        spikeGrow = smoothstep(0.0, SPIKE_TIME, clock);
+        still = (phc < JUMP_T || phc >= EXIT_T) ? 1.0
+              : (phc < PEAK_T) ? 0.0
+              : smoothstep(EXIT_T - 0.6, EXIT_T, phc);
+    }
+    float crossAmt = still * spikeGrow;            // = 1 (fully shown) when warp off
 
     bool  warping = (zHi - zLo) > 0.001;
     int   K = warping ? KMAX : 1;
@@ -376,7 +406,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord){
     }
     stars *= STAR_GAIN;
 
-    stars += heroStars(pr, zLo, zHi, warp, seed, invSR, spikeGrow, still, R.x / R.y);
+    stars += heroStars(pr, zLo, zHi, warp, seed, invSR, SR, spikeGrow, still, R.x / R.y);
 
     // brighten hard toward the climax so the streaks blaze & the screen fills
     stars *= 1.0 + warp * WARP_GLOW;
