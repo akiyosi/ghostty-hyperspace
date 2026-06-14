@@ -8,7 +8,7 @@ a brand‑new sky on the far side.
 It is a background shader: the terminal text stays crisp on top (opaque‑safe
 compositing, so no transparency setting is required).
 
-https://github.com/ — drop your own demo gif/video here.
+**Demo:** https://x.com/akiyosi_x/status/2066176698572476875
 
 ## What it does
 
