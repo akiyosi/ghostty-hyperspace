@@ -20,6 +20,10 @@ https://github.com/ — drop your own demo gif/video here.
     diffraction spikes,
   - on ~half of the locations, an edge‑on **galactic disk**: a band where stars
     bunch up, with a faint diffuse dust glow.
+  - **rare destination** — occasionally a jump drops you *inside a nebula*:
+    domain‑warped emission gas with ridged filaments, ionised H‑alpha cores,
+    O‑III teal mid‑tones, a cool blue reflection haze, and dark dust lanes
+    (palette rolled per region). It fades in on arrival, like the galaxy band.
 - **Jump** — tails grow outward from each star (a gentle ~0.7 s onset, then
   full), a flash swaps in the destination field, and the new sky's starlines
   converge to points (the bright suns' spikes then extend in over a couple of
@@ -109,6 +113,23 @@ Edit the `hn < …` thresholds to change how often a bright sun appears.
 
 A disk appears in ~50% of locations (see the `galOn = step(0.5, …)` in
 `fieldStars`/`mainImage`).
+
+### Rare nebula region
+
+Rolled per jump from the seed (an ordinary star field is by far the most common
+outcome).
+
+| Constant | Default | Meaning |
+|---|---|---|
+| `NEBULA_PROB` | `0.08` | Chance a destination is inside a nebula. |
+| `NEBULA_GAIN` | `0.70` | Nebula brightness (kept gentle so text stays legible). |
+| `NEB_STAR_GAIN` | `1.3` | Brightness of the cluster stars embedded in the gas (white core). |
+| `NEB_STAR_RARE` | `0.84` | Sparseness of those stars (higher = fewer). |
+| `NEB_STAR_DENS` | `0.48` | Only place them where the gas density exceeds this. |
+| `NEB_STAR_TINT` | `0.7` | How much their halo takes the gas colour. |
+
+Set `NEBULA_PROB` to `0` to disable nebula regions. The embedded stars sit only
+in the thick, bright gas and streak with the field during a jump.
 
 ### Compositing
 

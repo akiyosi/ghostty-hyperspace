@@ -69,6 +69,14 @@ const float GAL_WIDTH = 0.22;   // thickness of the galactic band (screen height
 const float GAL_DENS  = 3.5;    // extra star density along the galactic plane
 const float GAL_GLOW  = 1.4;    // brightness of the band's diffuse (unresolved) glow
 
+// ---- rare destination regions (rolled per jump from the seed) ------
+const float NEBULA_PROB = 0.08; // chance a destination drops you inside a nebula (rare)
+const float NEBULA_GAIN = 0.70; // nebula brightness (keep gentle so text stays legible)
+const float NEB_STAR_GAIN = 1.3;  // brightness of the nebula's embedded stars (white core)
+const float NEB_STAR_RARE = 0.84; // sparseness of those stars (higher = fewer, "ポツポツ")
+const float NEB_STAR_DENS = 0.48; // only host stars where the gas density exceeds this
+const float NEB_STAR_TINT = 0.7;  // how much the halo takes the gas colour (core stays white)
+
 // ---- compositing (opaque-safe: Ghostty AND Zonvie) ----------
 #define BLEND_ALPHA 0           // 1: alpha blend (transparent Ghostty only)
 const float BG_LEVEL = 0.12;    // theme background brightness (raise if needed)
@@ -104,6 +112,32 @@ float fbm(vec2 p){
     float s = 0.0, a = 0.5;
     for (int i = 0; i < 4; i++){ s += a * vnoise(p); p *= 2.03; a *= 0.5; }
     return s;
+}
+// ridged turbulence: |noise| folds create sharp creases -> wispy filaments
+float turb(vec2 p){
+    float s = 0.0, a = 0.5;
+    for (int i = 0; i < 5; i++){ s += a * abs(vnoise(p) * 2.0 - 1.0); p *= 2.07; a *= 0.55; }
+    return s;
+}
+// HIGH-DETAIL fractal noise for the nebula. Many octaves give true multi-scale
+// structure (fine wisps, not big blobs); a rotation + offset between octaves
+// decorrelates them so the value-noise grid never shows through.
+const mat2 NROT = mat2(0.80, 0.60, -0.60, 0.80);
+float fbmHi(vec2 p){
+    float s = 0.0, a = 0.5, n = 0.0;
+    for (int i = 0; i < 7; i++){
+        s += a * vnoise(p); n += a;
+        p = NROT * p * 2.0 + 11.3; a *= 0.52;
+    }
+    return s / n;
+}
+float turbHi(vec2 p){
+    float s = 0.0, a = 0.5, n = 0.0;
+    for (int i = 0; i < 7; i++){
+        s += a * abs(vnoise(p) * 2.0 - 1.0); n += a;
+        p = NROT * p * 2.0 + 7.7; a *= 0.52;
+    }
+    return s / n;
 }
 
 // ---- blackbody colour (Planckian locus, ~1500..30000 K) -----
@@ -205,6 +239,43 @@ vec3 polarLayer(vec2 q, float angN, float radS, float seed, float pw, float gain
     return starColor(ch) * br * exp(-dot(f, f) / sq(0.34)) * gain;
 }
 
+// large-scale gas-density proxy for PLACING the embedded nebula stars (cheap:
+// low-octave only -- it just needs to follow where the cloud is visibly thick,
+// not match the detailed render). ~0..1.
+float nebDensity(vec2 p, float seed){
+    vec2  q  = p * 1.6 + seed;
+    vec2  w1 = vec2(fbm(q + 1.7), fbm(q + vec2(4.3, 2.1)));
+    vec2  qq = q + 1.7 * w1;
+    float body = fbm(qq);
+    float env  = mix(0.35, 1.0, smoothstep(0.10, 0.85, fbm(q * 0.5 + seed + 7.0)));
+    return smoothstep(0.34, 0.85, body) * env;
+}
+
+// embedded nebula stars: WHITE core (point), halo tinted toward the gas colour.
+// A touch larger than the field points, and rendered with the SAME radial
+// stretch (rdir/el/zk) as the field, so the zoom-blur streaks them into tails
+// during the jump like every other star.
+vec3 nebStarLayer(vec2 c, float scale, float so, vec3 tint,
+                  vec2 rdir, float el, float zk){
+    vec2  g  = c * scale;
+    vec2  id = floor(g);
+    vec2  f  = fract(g) - 0.5;
+    float present = step(NEB_STAR_RARE, hash22(id + vec2(so + 1.0, so * 1.3 + 2.0)).x);
+    if (present < 0.5) return vec3(0.0);                 // sparse: most cells empty
+    vec2  off = (hash22(id + vec2(so + 5.0, so * 0.7 + 9.0)) - 0.5) * 0.7;
+    vec2  rel = f - off;
+    float al  = dot(rel, rdir);                          // along the radial
+    float pe  = dot(rel, vec2(-rdir.y, rdir.x));         // perpendicular
+    float rad = STAR_PX * scale / zk * 1.8;             // a touch larger than a point
+    float d2  = sq(pe / max(rad, 1e-4)) + sq(al / max(rad * el, 1e-4));
+    float core = exp(-d2);
+    float hd2  = sq(pe / max(rad * 5.0, 1e-4)) + sq(al / max(rad * 5.0 * el, 1e-4));
+    float halo = exp(-hd2) * 0.30;
+    float br   = mix(0.7, 1.0, hash22(id + vec2(so + 3.0, so * 0.9 + 7.0)).y);
+    vec3  haloCol = mix(vec3(1.0), tint, NEB_STAR_TINT);
+    return (vec3(core) + haloCol * halo) * br * NEB_STAR_GAIN;
+}
+
 vec3 fieldStars(vec2 c, float seed, vec2 rdir, float el, float zk, float warp,
                 mat2 invSR, float crossAmt){
     // galactic plane: a band across the sky (orientation/offset per location)
@@ -233,6 +304,19 @@ vec3 fieldStars(vec2 c, float seed, vec2 rdir, float el, float zk, float warp,
     if (late > 0.001){
         col += ( polarLayer(c, 200.0, 26.0, seed + 21.0, 2.4, 0.85)
                + polarLayer(c, 200.0, 40.0, seed + 22.0, 2.8, 0.60) ) * late;
+    }
+
+    // embedded nebula stars -- ONLY in nebula regions, ONLY where the gas is
+    // thick (sparse, in the dense cores). Part of the field, so they streak
+    // into tails during the jump exactly like the rest of the stars.
+    float nebOn = step(1.0 - NEBULA_PROB, hash11(seed * 0.741 + 17.0));
+    if (nebOn > 0.5){
+        float gate = smoothstep(NEB_STAR_DENS, NEB_STAR_DENS + 0.15, nebDensity(c, seed));
+        if (gate > 0.001){
+            float nhp  = hash11(seed * 0.37 + 3.0);
+            vec3  tint = mix(vec3(0.66, 0.14, 0.18), vec3(0.60, 0.11, 0.28), nhp);
+            col += nebStarLayer(c, 8.0 * DENS, seed + 60.0, tint, rdir, el, zk) * gate;
+        }
     }
     return col;
 }
@@ -289,6 +373,69 @@ vec3 heroStars(vec2 p, float zLo, float zHi, float warp, float seed,
         col += (vec3(core) + c * (halo + spikes)) * mag * still * vis;
     }
     return col * HERO_GAIN;
+}
+
+// ---- rare region: an emission nebula filling the sky --------
+//  A layered model of a real diffuse nebula:
+//    * two-octave DOMAIN WARP -> billowing, non-tiling gas (not blobby fbm),
+//    * MULTI-SCALE structure: a smooth body, ridged filaments (bright rims),
+//      and fine high-frequency wisps,
+//    * a large-scale ENVELOPE so the glow is concentrated, not a flat fill,
+//    * IONISATION: emission rises with density -- S-II deep red outskirts,
+//      H-alpha red main body, O-III teal only in the hottest cores, with a
+//      faint blue reflection haze at the edges and near-white knots,
+//    * DUST: its own warped field carves SHARP dark lanes that silhouette
+//      against the glow AND hide the stars behind (returned in `ext`).
+//  The palette is rolled per region so each nebula looks distinct.
+vec3 nebula(vec2 p, float seed, out float ext){
+    vec2 q = p * 1.6 + seed;
+
+    // domain warp (low-octave, large-scale displacement) -> billowing gas
+    vec2 w1 = vec2(fbm(q + 1.7),            fbm(q + vec2(4.3, 2.1)));
+    vec2 w2 = vec2(fbm(q * 2.0 + 3.0 * w1), fbm(q * 2.0 + 3.0 * w1 + 9.0));
+    vec2 qq = q + 1.7 * w1 + 0.8 * w2;
+
+    // multi-scale FRACTAL structure (7 rotated octaves -> fine, organic detail)
+    float body = fbmHi(qq);
+    float fil  = 1.0 - turbHi(qq * 1.7 + seed * 0.5);  // filaments / rims, all scales
+    float wisp = turbHi(qq * 3.3 + seed);              // finest high-freq texture
+    float gas  = body * 0.72 + fil * 0.42 - wisp * 0.14;
+
+    // large-scale envelope: the glow concentrates and fades toward dark sky
+    float env  = mix(0.35, 1.0, smoothstep(0.10, 0.85, fbm(q * 0.5 + seed + 7.0)));
+    float dens = smoothstep(0.30, 0.92, gas) * env;
+    float ion  = smoothstep(0.48, 0.95, gas) * env;    // emission intensity
+    float core = pow(max(ion, 0.0), 4.0);              // hottest ionised knots
+
+    // natural emission palette (H-alpha red dominant; teal only in hot cores)
+    float hp = hash11(seed * 0.37 + 3.0);
+    vec3 cRefl = vec3(0.09, 0.12, 0.28);                               // blue reflection
+    vec3 cSII  = vec3(0.34, 0.06, 0.08);                               // S-II deep red
+    vec3 cHa   = mix(vec3(0.66, 0.14, 0.18), vec3(0.60, 0.11, 0.28), hp); // H-alpha
+    vec3 cOIII = mix(vec3(0.16, 0.34, 0.30), vec3(0.12, 0.36, 0.40), hp); // O-III teal
+
+    vec3 col = cRefl;
+    col = mix(col, cSII,  smoothstep(0.04, 0.40, dens));
+    col = mix(col, cHa,   smoothstep(0.25, 0.70, ion));
+    col = mix(col, cOIII, smoothstep(0.70, 0.97, ion) * (0.25 + 0.5 * hp)); // teal accent
+    col *= dens;
+    col += mix(cHa, vec3(1.0, 0.92, 0.85), 0.6) * core * 0.6;          // white-pink cores
+
+    // fine granular mottling -> the gas is never flat, even where it's bright
+    float grain = mix(0.78, 1.12, fbmHi(qq * 2.4 + seed + 3.0));
+    col *= grain;
+
+    // dust: a warped, multi-scale field -> fine FILAMENTARY dark lanes (not
+    // smooth blobs). ext < 1 also dims the starfield behind, so the lanes
+    // read as real silhouettes.
+    vec2  dq    = q + 0.9 * w1;
+    float dustF = fbmHi(dq * 0.9 + seed + 20.0) * 0.65
+                + turbHi(dq * 1.8 + seed + 5.0) * 0.35;
+    float dust  = smoothstep(0.42, 0.72, dustF);
+    ext = 1.0 - 0.85 * dust;
+    col *= ext;
+
+    return max(col, 0.0) * NEBULA_GAIN;
 }
 
 // ---- jump state machine -------------------------------------
@@ -361,6 +508,11 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord){
                ? launch                                   // never warp -> one fixed sky
                : mod(floor((iTime - PEAK_T) / CYCLE) * 131.7 + launch, 977.0);
 
+    // roll a destination TYPE from the seed: most regions are ordinary star
+    // fields, but rarely you arrive inside a nebula.
+    float rtype = hash11(seed * 0.741 + 17.0);
+    float isNeb = step(1.0 - NEBULA_PROB, rtype);
+
     // ---- radial zoom-blur: cost is K, not the star count --------
     //  q = ps/zk samples the field at receding "previous" positions;
     //  accumulating them smears each star into a radial streak whose
@@ -428,7 +580,19 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord){
     float lane = smoothstep(0.35, 0.70, fbm(pr * 7.0 + seed + 11.0));
     vec3  gcol = mix(vec3(0.05, 0.05, 0.07), vec3(0.11, 0.10, 0.10), dust);
     float galOn = step(0.5, hash11(seed * 0.331 + 2.0)); // same flag as fieldStars
+    galOn *= (1.0 - isNeb);                               // a nebula owns the sky instead
     space += gcol * gband * GAL_GLOW * (1.0 - 0.6 * lane) * (1.0 - 0.85 * warp) * galOn;
+
+    // rare nebula GAS -- vanishes quickly once the jump begins (gone by warp
+    // ~0.22) and settles back in only on arrival. Its dust lanes (ext) dim the
+    // starfield behind, so they read as silhouettes. The embedded stars are
+    // drawn with the field (in fieldStars), so they streak through the jump.
+    if (isNeb > 0.5){
+        float gasVis = 1.0 - smoothstep(0.0, 0.22, warp);
+        float ext;
+        vec3  neb = nebula(pr, seed, ext);
+        space = space * mix(1.0, ext, gasVis) + neb * gasVis;
+    }
 
     space += vec3(0.55, 0.7, 1.0) * coreGlow * exp(-r * r * 3.0) * 0.7;  // climax core
     space += vec3(0.90, 0.95, 1.0) * clamp(flash, 0.0, 2.6);            // jump flash
