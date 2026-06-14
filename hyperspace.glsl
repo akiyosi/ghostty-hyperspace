@@ -152,30 +152,32 @@ float turbHi(vec2 p){
     return s / n;
 }
 
-// ---- blackbody colour (Planckian locus, ~1500..30000 K) -----
-vec3 blackbody(float K){
-    K = clamp(K, 1500.0, 30000.0);
-    float t = K / 100.0;
-    float r, g, b;
-    if (t <= 66.0) r = 1.0;
-    else           r = clamp(1.292 * pow(t - 60.0, -0.1332), 0.0, 1.0);
-    if (t <= 66.0) g = clamp(0.390 * log(t) - 0.634, 0.0, 1.0);
-    else           g = clamp(1.129 * pow(t - 60.0, -0.0755), 0.0, 1.0);
-    if (t >= 66.0) b = 1.0;
-    else if (t <= 19.0) b = 0.0;
-    else           b = clamp(0.543 * log(t - 10.0) - 1.196, 0.0, 1.0);
-    return vec3(r, g, b);
-}
-
 // ---- realistic stellar colour from a 0..1 seed --------------
-//  Real populations skew COOL (many orange/red dwarfs, fewer white, rare
-//  blue). Map the hash through a cool-weighted temperature, take the true
-//  blackbody colour, and desaturate a little (as the eye sees faint stars).
+//  Real populations skew COOL (many orange/red dwarfs, fewer white, rare blue).
+//  This is a direct polynomial fit of the original pipeline -- a cool-weighted
+//  Planckian blackbody (pow(h,2.4) temperature map, ~2900..22000 K) followed by
+//  a slight desaturation -- so the look is unchanged while the per-call cost
+//  drops from pow + 2*log to a couple of vec3 multiply-adds. That matters: this
+//  is evaluated 6+ times per pixel (once per star layer). Two degree-4 segments
+//  meet at the t=6600 K kink (h~0.505); fitted max error < 3/255 vs the exact
+//  curve, verified offline against the Planckian formula it replaces.
 vec3 starColor(float h){
-    float temp = mix(2900.0, 22000.0, pow(h, 2.4));   // cool-weighted; rare hot/blue
-    vec3  c = blackbody(temp);
-    float luma = dot(c, vec3(0.299, 0.587, 0.114));
-    return mix(vec3(luma), c, 0.82);                   // slight desaturation
+    vec3 c0, c1, c2, c3, c4;                            // per-channel (R,G,B) coeffs
+    if (h <= 0.505){
+        c0 = vec3( 0.95401,  0.69176,  0.46645);
+        c1 = vec3(-0.01010, -0.06114, -0.15086);
+        c2 = vec3( 0.22734,  1.41200,  3.21231);
+        c3 = vec3( 0.09768,  0.94526, -0.36313);
+        c4 = vec3(-0.30375, -2.20492, -2.65259);
+    } else {
+        c0 = vec3(  7.42132,   4.95419,  1.77939);
+        c1 = vec3(-31.24299, -19.29218, -3.79784);
+        c2 = vec3( 56.03340,  34.55383,  6.80634);
+        c3 = vec3(-45.27378, -27.92664, -5.50023);
+        c4 = vec3( 13.74195,   8.48151,  1.67002);
+    }
+    vec3 col = (((c4 * h + c3) * h + c2) * h + c1) * h + c0;  // Horner, 3 channels
+    return clamp(col, 0.0, 1.0);
 }
 
 // ---- cheap cell starfield (uniform, any density, O(1)) ------
