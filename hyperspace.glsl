@@ -32,8 +32,8 @@
 // ---------------- tunables -----------------------------------
 const float CYCLE     = 24.0;   // seconds between jumps
 const float JUMP_T    = 9.0;    // warp begins (tails grow outward)
-const float PEAK_T    = 16.0;   // field swap flash (~7s entry)
-const float EXIT_T    = 23.0;   // arrival: dense centre lines converge (~7s)
+const float PEAK_T    = 13.0;   // field swap flash (~4s entry, snappier)
+const float EXIT_T    = 17.0;   // arrival: dense centre lines converge (~4s)
 
 const float EMAX      = 1.1;    // entry stretch: how far each line extends outward
 const float CONV      = 0.96;   // exit stretch: inward tails reach near the centre (<1)
@@ -50,6 +50,19 @@ const float SPIKE_TIME= 2.2;    // seconds for the bright suns' spikes to extend
 
 const int   HERO_MAX  = 3;      // up to this many extra-bright nearby suns
 const float HERO_GAIN = 2.3;    // their brightness
+
+// ---- realism: colour spread, rare close stars, galactic plane -----
+const float NEAR_RARE = 0.991;  // rarity threshold for a "nearby" brighter star
+                                // (higher = rarer; ~0.9% of cells above 0.991)
+const float NEAR_GLOW = 0.12;   // soft halo of those rare stars (NO spikes -- that
+                                // stays exclusive to the hero "dazzling" suns)
+const float CROSS_RATE= 0.9999; // step threshold -> ~0.01% of points carry a small
+                                // diffraction cross (very rare special star)
+const float CROSS_AMP = 0.42;   // brightness of that cross
+const float CROSS_LEN = 0.035;  // its arm length (screen heights)
+const float GAL_WIDTH = 0.22;   // thickness of the galactic band (screen heights)
+const float GAL_DENS  = 2.5;    // extra star density along the galactic plane
+const float GAL_GLOW  = 0.5;    // brightness of the band's diffuse (unresolved) glow
 
 // ---- compositing (opaque-safe: Ghostty AND Zonvie) ----------
 #define BLEND_ALPHA 0           // 1: alpha blend (transparent Ghostty only)
@@ -72,13 +85,46 @@ vec2 hash22(vec2 p){
     return fract((p3.xx + p3.yz) * p3.zy);
 }
 
-// ---- stellar colour from a 0..1 seed (white-biased) ---------
+// ---- value-noise fbm (galactic dust) ------------------------
+float vnoise(vec2 p){
+    vec2 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float a = hash11(dot(i, vec2(1.0, 57.0)));
+    float b = hash11(dot(i + vec2(1.0, 0.0), vec2(1.0, 57.0)));
+    float c = hash11(dot(i + vec2(0.0, 1.0), vec2(1.0, 57.0)));
+    float d = hash11(dot(i + vec2(1.0, 1.0), vec2(1.0, 57.0)));
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+float fbm(vec2 p){
+    float s = 0.0, a = 0.5;
+    for (int i = 0; i < 4; i++){ s += a * vnoise(p); p *= 2.03; a *= 0.5; }
+    return s;
+}
+
+// ---- blackbody colour (Planckian locus, ~1500..30000 K) -----
+vec3 blackbody(float K){
+    K = clamp(K, 1500.0, 30000.0);
+    float t = K / 100.0;
+    float r, g, b;
+    if (t <= 66.0) r = 1.0;
+    else           r = clamp(1.292 * pow(t - 60.0, -0.1332), 0.0, 1.0);
+    if (t <= 66.0) g = clamp(0.390 * log(t) - 0.634, 0.0, 1.0);
+    else           g = clamp(1.129 * pow(t - 60.0, -0.0755), 0.0, 1.0);
+    if (t >= 66.0) b = 1.0;
+    else if (t <= 19.0) b = 0.0;
+    else           b = clamp(0.543 * log(t - 10.0) - 1.196, 0.0, 1.0);
+    return vec3(r, g, b);
+}
+
+// ---- realistic stellar colour from a 0..1 seed --------------
+//  Real populations skew COOL (many orange/red dwarfs, fewer white, rare
+//  blue). Map the hash through a cool-weighted temperature, take the true
+//  blackbody colour, and desaturate a little (as the eye sees faint stars).
 vec3 starColor(float h){
-    vec3 warm = vec3(1.00, 0.78, 0.55);  // K / M  orange-red
-    vec3 white= vec3(1.00, 0.97, 0.92);  // G / F  sun-white
-    vec3 blue = vec3(0.74, 0.83, 1.00);  // A / B  blue-white
-    return h < 0.5 ? mix(warm, white, h * 2.0)
-                   : mix(white, blue, (h - 0.5) * 2.0);
+    float temp = mix(2900.0, 22000.0, pow(h, 2.4));   // cool-weighted; rare hot/blue
+    vec3  c = blackbody(temp);
+    float luma = dot(c, vec3(0.299, 0.587, 0.114));
+    return mix(vec3(luma), c, 0.82);                   // slight desaturation
 }
 
 // ---- cheap cell starfield (uniform, any density, O(1)) ------
@@ -87,19 +133,43 @@ vec3 starColor(float h){
 //  `el` during warp, so each motion-blur sample is a short dash that
 //  joins the next -> continuous thin starlines with few samples.
 vec3 cellLayer(vec2 c, float scale, float seed, float pw, float gain,
-               vec2 rdir, float el, float zk){
+               vec2 rdir, float el, float zk, float galDen,
+               mat2 invSR, float crossAmt){
     vec2 g  = c * scale;
     vec2 id = floor(g);
     vec2 f  = fract(g) - 0.5;
     float br = pow(hash11(dot(id, vec2(127.1, 311.7)) + seed), pw);
+    br *= galDen;                                     // denser along the galaxy
     vec2  off = (hash22(id + seed) - 0.5) * 0.7;
+    // rare "nearby" star: only slightly larger, modestly brighter, plus a
+    // SOFT halo (no diffraction cross -- that is the hero suns' alone)
+    float near = smoothstep(NEAR_RARE, 1.0, hash11(dot(id, vec2(91.7, 17.3)) + seed));
+    float size = 1.0 + near * 0.45;
+    br *= 1.0 + near * 1.3;
     vec2  rel = f - off;
     float al  = dot(rel, rdir);                       // along the radial
     float pe  = dot(rel, vec2(-rdir.y, rdir.x));      // perpendicular
-    float rad = STAR_PX * scale / zk;                  // /zk -> CONSTANT screen width
+    float rad = STAR_PX * scale / zk * size;           // /zk -> CONSTANT screen width
     float d2  = sq(pe / max(rad, 1e-4)) + sq(al / max(rad * el, 1e-4));
+    float core = exp(-d2);
+    float hd2  = sq(pe / max(rad * 6.0, 1e-4)) + sq(al / max(rad * 6.0 * el, 1e-4));
+    float halo = near * NEAR_GLOW * exp(-hd2);         // gentle glow for near stars
     float ch  = hash11(dot(id, vec2(57.0, 113.0)) + seed);
-    return starColor(ch) * br * exp(-d2) * gain;
+    vec3  col = starColor(ch) * br * (core + halo) * gain;
+
+    // ~30% of points carry a small diffraction cross, screen-axis aligned
+    // (undo the field rotation) and only at rest (crossAmt 0 during warp).
+    if (crossAmt > 0.001){
+        float cz = step(CROSS_RATE, hash11(dot(id, vec2(53.1, 7.7)) + seed));
+        if (cz > 0.0){
+            vec2  so  = invSR * (rel / scale);         // star->pixel, screen axes
+            float len = CROSS_LEN * crossAmt;
+            float sx  = exp(-sq(so.y) / sq(0.0014)) * exp(-abs(so.x) / max(len, 1e-4));
+            float sy  = exp(-sq(so.x) / sq(0.0014)) * exp(-abs(so.y) / max(len, 1e-4));
+            col += starColor(ch) * br * (sx + sy) * CROSS_AMP * crossAmt * gain;
+        }
+    }
+    return col;
 }
 // log-polar star layer: stars on an (angle, log radius) grid, so the
 // on-screen density rises naturally toward the centre (the 1/r^2 of looking
@@ -120,17 +190,28 @@ vec3 polarLayer(vec2 q, float angN, float radS, float seed, float pw, float gain
     return starColor(ch) * br * exp(-dot(f, f) / sq(0.34)) * gain;
 }
 
-vec3 fieldStars(vec2 c, float seed, vec2 rdir, float el, float zk, float warp){
+vec3 fieldStars(vec2 c, float seed, vec2 rdir, float el, float zk, float warp,
+                mat2 invSR, float crossAmt){
+    // galactic plane: a band across the sky (orientation/offset per location)
+    // along which stars are markedly denser -- the Milky-Way disk edge-on.
+    float ga   = hash11(seed * 0.531 + 4.0) * 3.14159;
+    vec2  gN   = vec2(-sin(ga), cos(ga));            // band normal
+    float gOff = (hash11(seed * 0.917 + 8.0) - 0.5) * 0.7;
+    float bd   = dot(c, gN) - gOff;                   // distance from band centre
+    float band = exp(-bd * bd / (GAL_WIDTH * GAL_WIDTH));
+    float galOn = step(0.5, hash11(seed * 0.331 + 2.0)); // ~50%: this region has a disk
+    float galDen = 1.0 + GAL_DENS * band * galOn;     // density bias toward the disk
+
     // distant suns -- FIXED positions. During warp they stretch in place
     // (the radial sampling does it); they never fly past or vanish.
-    vec3 col = cellLayer(c,  7.0 * DENS, seed + 1.0, 2.4, 0.65, rdir, el, zk)
-             + cellLayer(c, 15.0 * DENS, seed + 2.0, 3.2, 0.45, rdir, el, zk)
-             + cellLayer(c, 31.0 * DENS, seed + 3.0, 4.0, 0.33, rdir, el, zk);
+    vec3 col = cellLayer(c,  7.0 * DENS, seed + 1.0, 2.4, 0.65, rdir, el, zk, galDen, invSR, crossAmt)
+             + cellLayer(c, 15.0 * DENS, seed + 2.0, 3.2, 0.45, rdir, el, zk, galDen, invSR, crossAmt)
+             + cellLayer(c, 31.0 * DENS, seed + 3.0, 4.0, 0.33, rdir, el, zk, galDen, invSR, crossAmt);
     // fainter, more numerous suns, revealed by the jump's light-stretch
     float rev = mix(REVEAL, 1.0, warp);
-    col += ( cellLayer(c, 55.0, seed + 11.0, 3.0, 0.50, rdir, el, zk)
-           + cellLayer(c,105.0, seed + 12.0, 3.6, 0.40, rdir, el, zk)
-           + cellLayer(c,200.0, seed + 13.0, 4.0, 0.32, rdir, el, zk) ) * rev;
+    col += ( cellLayer(c, 55.0, seed + 11.0, 3.0, 0.50, rdir, el, zk, galDen, invSR, crossAmt)
+           + cellLayer(c,105.0, seed + 12.0, 3.6, 0.40, rdir, el, zk, galDen, invSR, crossAmt)
+           + cellLayer(c,200.0, seed + 13.0, 4.0, 0.32, rdir, el, zk, galDen, invSR, crossAmt) ) * rev;
     // LATE WARP: a perspective (1/r^2) field packs dense stars + tails into
     // the centre. Absent in cruise (no centre haze); ramps in for the finale.
     float late = smoothstep(0.25, 0.75, warp);
@@ -145,15 +226,27 @@ vec3 fieldStars(vec2 c, float seed, vec2 rdir, float el, float zk, float warp){
 //  Cruise: hot white core + airy glow + 4-point diffraction spikes,
 //  tinted by colour. Warp: it streaks with the field (no spikes).
 vec3 heroStars(vec2 p, float zLo, float zHi, float warp, float seed,
-               mat2 invSR, float spikeGrow, float still){
+               mat2 invSR, float spikeGrow, float still, float aspect){
     vec3 col = vec3(0.0);
-    int n = 1 + int(hash11(seed * 0.37 + 5.0) * float(HERO_MAX));
+    // count: ~50% of jumps arrive beside no bright sun; the rest have 1..HERO_MAX
+    float hn = hash11(seed * 1.93 + 7.7);
+    int n = (hn < 0.50) ? 0 : (1 + int(hash11(seed * 2.7 + 3.0) * float(HERO_MAX)));
     for (int i = 0; i < HERO_MAX; i++){
         if (i >= n) break;
         float fi  = float(i) + 1.0;
-        vec2  P   = (hash22(vec2(fi * 9.13, seed + 50.0)) - 0.5) * 1.7;
-        float mag = mix(0.6, 1.0, hash11(fi * 6.6 + seed));
+        // position strongly randomised by BOTH the per-sun index and the
+        // per-jump seed, so it lands somewhere genuinely different each time
+        vec2  P   = (hash22(vec2(fi * 37.1 + seed * 1.7,
+                                 seed * 0.97 + fi * 13.3)) - 0.5) * 1.85;
+        float mag = mix(0.6, 1.0, hash11(fi * 6.6 + seed * 2.1));
         vec3  c   = starColor(hash11(fi * 7.1 + seed));
+
+        // on-screen test (in screen/ps coords): if the sun is off-screen,
+        // don't draw its realistic core/glow/spikes (no stray cross arms).
+        vec2  hpos = invSR * P;
+        float ax   = aspect * 0.5;
+        float vis  = (1.0 - smoothstep(ax - 0.05, ax + 0.02, abs(hpos.x)))
+                   * (1.0 - smoothstep(0.45,     0.52,      abs(hpos.y)));
 
         // warp: the streak segment [P*zLo, P*zHi], same as the field
         vec2  head = P * zHi, tail = P * zLo;
@@ -175,7 +268,7 @@ vec3 heroStars(vec2 p, float zLo, float zHi, float warp, float seed,
         float sx = exp(-sq(ds.y) / sq(0.0015)) * exp(-abs(ds.x) / max(sl, 1e-4));
         float sy = exp(-sq(ds.x) / sq(0.0015)) * exp(-abs(ds.y) / max(sl, 1e-4));
         float spikes = (sx + sy) * 0.45 * spikeGrow;
-        col += (vec3(core) + c * (halo + spikes)) * mag * still;
+        col += (vec3(core) + c * (halo + spikes)) * mag * still * vis;
     }
     return col * HERO_GAIN;
 }
@@ -243,6 +336,20 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord){
     mat2  invSR = mat2(cos(sa), sin(sa), -sin(sa), cos(sa));  // undo rotation (screen axes)
     vec2  pr = SR * ps;
 
+    // spike timing: crosses (hero + the ~30% field stars) appear only at rest
+    // and EXTEND after arrival; crossAmt = still * spikeGrow (0 during warp).
+    float phc = mod(iTime, CYCLE);
+    float clock = (phc >= EXIT_T) ? (phc - EXIT_T)
+                : (phc < JUMP_T)  ? (phc + CYCLE - EXIT_T)
+                                  : 0.0;
+    float spikeGrow = smoothstep(0.0, SPIKE_TIME, clock);
+    float still = (phc < JUMP_T || phc >= EXIT_T) ? 1.0
+                : (phc < PEAK_T) ? 0.0
+                : smoothstep(EXIT_T - 0.6, EXIT_T, phc);
+    // cross-stars are a very rare special point (~0.01%, set by CROSS_RATE);
+    // crosses still only appear at rest and extend after arrival.
+    float crossAmt = still * spikeGrow;
+
     bool  warping = (zHi - zLo) > 0.001;
     int   K = warping ? KMAX : 1;
     vec2  rdir = normalize(pr + vec2(1e-5));         // radial direction from centre
@@ -256,24 +363,11 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord){
         vec2  q  = pr / zk;
         // MAX (not sum/K): every point on the streak keeps the star's FULL
         // brightness -- so even the short early streaks read brightly.
-        stars = max(stars, fieldStars(q, seed, rdir, el, zk, warp));
+        stars = max(stars, fieldStars(q, seed, rdir, el, zk, warp, invSR, crossAmt));
     }
     stars *= STAR_GAIN;
 
-    // the bright suns' diffraction spikes EXTEND only AFTER arrival: zero
-    // during the whole jump [JUMP_T, EXIT_T], then grow through cruise
-    // (continuous across the cycle wrap).
-    float phc = mod(iTime, CYCLE);
-    float clock = (phc >= EXIT_T) ? (phc - EXIT_T)
-                : (phc < JUMP_T)  ? (phc + CYCLE - EXIT_T)
-                                  : 0.0;                  // jump in progress: no spikes
-    float spikeGrow = smoothstep(0.0, SPIKE_TIME, clock);
-    // hero realistic star: streaks during the jump, then fades in smoothly
-    // as the streak converges to its point near arrival
-    float still = (phc < JUMP_T || phc >= EXIT_T) ? 1.0
-                : (phc < PEAK_T) ? 0.0
-                : smoothstep(EXIT_T - 0.6, EXIT_T, phc);
-    stars += heroStars(pr, zLo, zHi, warp, seed, invSR, spikeGrow, still);
+    stars += heroStars(pr, zLo, zHi, warp, seed, invSR, spikeGrow, still, R.x / R.y);
 
     // brighten hard toward the climax so the streaks blaze & the screen fills
     stars *= 1.0 + warp * WARP_GLOW;
@@ -282,6 +376,21 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord){
     // ---- assemble the frame ---------------------------------
     vec3 space = vec3(0.004, 0.006, 0.012);
     space += stars;
+
+    // galactic band: faint diffuse glow of unresolved stars + dust lanes,
+    // along the same plane the field is densified on. A cruise feature
+    // (fades during the jump). Orientation per location (seed).
+    float gga  = hash11(seed * 0.531 + 4.0) * 3.14159;
+    vec2  ggN  = vec2(-sin(gga), cos(gga));
+    float ggO  = (hash11(seed * 0.917 + 8.0) - 0.5) * 0.7;
+    float gbd  = dot(pr, ggN) - ggO;
+    float gband= exp(-gbd * gbd / sq(GAL_WIDTH * 1.6));
+    float dust = fbm(pr * 3.0 + seed);
+    float lane = smoothstep(0.35, 0.70, fbm(pr * 7.0 + seed + 11.0));
+    vec3  gcol = mix(vec3(0.05, 0.05, 0.07), vec3(0.11, 0.10, 0.10), dust);
+    float galOn = step(0.5, hash11(seed * 0.331 + 2.0)); // same flag as fieldStars
+    space += gcol * gband * GAL_GLOW * (1.0 - 0.6 * lane) * (1.0 - 0.85 * warp) * galOn;
+
     space += vec3(0.55, 0.7, 1.0) * coreGlow * exp(-r * r * 3.0) * 0.7;  // climax core
     space += vec3(0.90, 0.95, 1.0) * clamp(flash, 0.0, 2.6);            // jump flash
 
