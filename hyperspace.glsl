@@ -70,6 +70,7 @@ const float GAL_DENS  = 4.0;    // extra star density along the disk (piles up a
 const float GAL_GLOW  = 0.55;   // brightness of the band's diffuse (unresolved) glow
 const float GAL_BULGE = 0.5;    // along-band size of the bright galactic centre (bulge)
 const float GAL_GRAIN = 0.05;   // baseline carpet-point brightness (just above the fog)
+const float GAL_DUST  = 0.92;   // darkness of the local dark gas clouds over the bulge (0..1)
 
 // ---- rare destination regions (rolled per jump from the seed) ------
 const float NEBULA_PROB = 0.08; // chance a destination drops you inside a nebula (rare)
@@ -305,6 +306,22 @@ vec3 galGrainStars(vec2 c, float scale, float so, vec2 rdir, float el, float zk,
     return starColor(ch) * br * exp(-d2);               // coloured points, no halo
 }
 
+// local dark gas clouds over the galactic centre, in TWO tiers for contrast:
+//  * broad irregular clouds -- dark but slightly translucent (capped by GAL_DUST)
+//  * rarer, smaller, MUCH darker dense cores (Bok globules) -> near-black spots
+// Domain-warped fbm makes organic shapes; confined to a region around the centre.
+// Returns 0 (clear) .. 1 (fully black).
+float galDust(vec2 p, float along, float bd, float gcen, float seed){
+    float region = exp(-(sq(bd / (GAL_WIDTH * 1.2)) + sq((along - gcen) / (GAL_BULGE * 1.0))));
+    vec2  dw = p * 7.0 + seed * 1.7;
+    vec2  wv = vec2(fbm(dw), fbm(dw + 4.3));           // domain warp -> organic shapes
+    float clouds = smoothstep(0.50, 0.78, fbm(dw + 1.7 * wv)) * GAL_DUST;
+    vec2  cw = p * 13.0 + seed * 3.1 + 20.0;          // finer, independent field
+    vec2  cv = vec2(fbm(cw), fbm(cw + 2.7));
+    float cores  = smoothstep(0.60, 0.82, fbm(cw + 1.5 * cv)); // rare, reaches full black
+    return clamp(max(clouds, cores) * region, 0.0, 1.0);
+}
+
 vec3 fieldStars(vec2 c, float seed, vec2 rdir, float el, float zk, float warp,
                 mat2 invSR, float crossAmt){
     // galactic plane: a band across the sky (orientation/offset per location)
@@ -340,11 +357,15 @@ vec3 fieldStars(vec2 c, float seed, vec2 rdir, float el, float zk, float warp,
            + cellLayer(c,200.0, seed + 13.0, 4.0, 0.32, rdir, el, zk, galDen, invSR, crossAmt) ) * rev;
     // dim star carpet: packed in the compact core, fading out well inside the
     // fog halo. The clump field carves knots/voids; a high cap packs it tight.
+    // Each grid is sqrt(2) finer than the prior pair -> 2x the cells, same size.
     float gdAmt = clamp(pow(conc, 2.0) * (0.12 + 0.88 * clump), 0.0, 0.95) * galOn;
-    // doubled again: each grid is sqrt(2) finer, so it holds 2x the cells (the
-    // points stay the same screen size -- only the count grows).
-    col += galGrainStars(c, 318.0 * DENS, seed + 71.0, rdir, el, zk, gdAmt)
-         + galGrainStars(c, 588.0 * DENS, seed + 72.0, rdir, el, zk, gdAmt);
+    vec3 carpet = galGrainStars(c, 318.0 * DENS, seed + 71.0, rdir, el, zk, gdAmt)
+                + galGrainStars(c, 588.0 * DENS, seed + 72.0, rdir, el, zk, gdAmt);
+    // local dark gas clouds sit IN FRONT of the dense carpet (hiding it) but
+    // BEHIND the resolved field stars above (which already accumulated in col).
+    // So the bright point stars punch through the clouds; the carpet is occluded.
+    float dark = galDust(c, dot(c, gD), bd, gcen, seed) * galOn;
+    col += carpet * (1.0 - dark);
     // LATE WARP: a perspective (1/r^2) field packs dense stars + tails into
     // the centre. Absent in cruise (no centre haze); ramps in for the finale.
     float late = smoothstep(0.25, 0.75, warp);
@@ -631,9 +652,13 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord){
     vec3  gcol = mix(vec3(0.05, 0.05, 0.07), vec3(0.11, 0.10, 0.10), dust);
     float galOn = step(0.5, hash11(seed * 0.331 + 2.0)); // same flag as fieldStars
     galOn *= (1.0 - isNeb);                               // a nebula owns the sky instead
+    // local dark clouds also block the fog glow behind them (same field as the
+    // carpet occlusion in fieldStars), so the dark patches read as silhouettes.
+    float gdark = galDust(pr, dot(pr, ggD), gbd, gcen2, seed);
     // a touch denser only where the stars crowd (the bulge) -- kept subtle
     space += gcol * gband * (1.0 + 0.5 * gbul) * GAL_GLOW
-             * (1.0 - 0.6 * lane) * (1.0 - 0.85 * warp) * galOn;
+             * (1.0 - 0.6 * lane) * (1.0 - gdark)
+             * (1.0 - 0.85 * warp) * galOn;
 
     // rare nebula GAS -- vanishes quickly once the jump begins (gone by warp
     // ~0.22) and settles back in only on arrival. Its dust lanes (ext) dim the
