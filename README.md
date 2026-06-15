@@ -1,6 +1,6 @@
 # hyperspace
 
-A custom terminal shader for **Ghostty** and **Zonvie**: you coast through a
+A custom terminal shader for **Ghostty** and [**Zonvie**](https://github.com/akiyosi/zonvie): you coast through a
 realistic starfield, and every so often the ship makes a Star Wars–style
 lightspeed jump — the stars stretch into radial starlines, blaze, and snap into
 a brand‑new sky on the far side.
@@ -48,7 +48,7 @@ custom-shader-animation = true
 
 Reload with `Cmd+Shift+,`.
 
-### Zonvie (`config.toml`)
+### [Zonvie](https://github.com/akiyosi/zonvie) (`config.toml`)
 
 ```toml
 [shaders]
@@ -171,3 +171,14 @@ you actually arrive inside a (rare) nebula region.
   seconds**, which makes that offset reseed the sky every second, so
   `LAUNCH_RANDOM` defaults to `0` (a rock‑steady field; the sky still changes on
   every jump). Enable it only on platforms with a stable sub‑second `iDate.w`.
+
+## Related projects
+
+- [**ghostty-cursor-gravity**](https://github.com/akiyosi/ghostty-cursor-gravity)
+  — another custom shader for Ghostty and [Zonvie](https://github.com/akiyosi/zonvie):
+  it warps the surrounding text around your cursor like gravitational lensing, and
+  cursor jumps send out radiating gravitational waves.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
